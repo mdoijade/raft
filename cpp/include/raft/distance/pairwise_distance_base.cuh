@@ -69,13 +69,13 @@ struct PairwiseDistances : public BaseClass {
   const DataT* xn;
   const DataT* yn;
   const DataT* const yBase;
+  bool kLoadDir;
   OutT* dOutput;
   char* smem;
   CoreLambda core_op;
   EpilogueLambda epilog_op;
   FinalLambda fin_op;
   rowEpilogueLambda rowEpilog_op;
-
   AccT acc[P::AccRowsPerTh][P::AccColsPerTh];
 
  public:
@@ -95,7 +95,7 @@ struct PairwiseDistances : public BaseClass {
       core_op(_core_op),
       epilog_op(_epilog_op),
       fin_op(_fin_op),
-      rowEpilog_op(_rowEpilog_op) {}
+      rowEpilog_op(_rowEpilog_op), kLoadDir(1) {}
 
   DI void run() {
     for (auto gridStrideY = blockIdx.y * P::Mblk; gridStrideY < this->m;
@@ -103,7 +103,7 @@ struct PairwiseDistances : public BaseClass {
       for (auto gridStrideX = blockIdx.x * P::Nblk; gridStrideX < this->n;
            gridStrideX += P::Nblk * gridDim.x) {
         prolog(gridStrideX, gridStrideY);
-        loop();
+        loop(gridStrideX);
         epilog(gridStrideX, gridStrideY);
       }
       rowEpilog_op(gridStrideY);
@@ -119,8 +119,7 @@ struct PairwiseDistances : public BaseClass {
       this->y += stride;
     }
     this->yrowid += stride;
-    this->pageWr = 0;
-    this->pageRd = 0;
+    kLoadDir ^= 1;
   }
 
   DI void updateIndicesXY() {
@@ -137,16 +136,23 @@ struct PairwiseDistances : public BaseClass {
     this->xrowid += stride;
     this->pageWr = 0;
     this->pageRd = 0;
+    kLoadDir = 1;
   }
 
   DI void prolog(IdxT gridStrideX, IdxT gridStrideY) {
     if (gridStrideX > blockIdx.x * P::Nblk) {
       updateIndicesY();
+      this->pageWr = this->pageRd;
+      auto kidx = kLoadDir ? 0 : ((this->k / P::Kblk) - 1) * P::Kblk;
+      kidx =  kidx < 0 ? 0 : kidx;
+      this->ldgY(kidx);
     } else if (gridStrideY > blockIdx.y * P::Mblk) {
       updateIndicesXY();
+      this->ldgXY(0);
+    } else {
+      this->ldgXY(0);
     }
 
-    this->ldgXY(0);
 #pragma unroll
     for (int i = 0; i < P::AccRowsPerTh; ++i) {
 #pragma unroll
@@ -154,13 +160,54 @@ struct PairwiseDistances : public BaseClass {
         acc[i][j] = BaseClass::Zero;
       }
     }
-    this->stsXY();
+
+    if (gridStrideX > blockIdx.x * P::Nblk) {
+      // Compiler is unable to generate STS.128 so can use
+      // __builtin_assume_aligned to force it.
+      this->stsY(this->sy + this->pageWr * P::SmemPage);
+    } else {
+      this->stsXY();
+    }
+
     __syncthreads();
     this->pageWr ^= 1;
   }
 
-  DI void loop() {
-    for (int kidx = P::Kblk; kidx < this->k; kidx += P::Kblk) {
+  DI void loop(IdxT gridStrideX) {
+    if (gridStrideX > blockIdx.x * P::Nblk) {
+      if (kLoadDir) {
+        loopForward();
+      } else {
+        loopReverse();
+      }
+    } else {
+      for (int kidx = P::Kblk; kidx < this->k; kidx += P::Kblk) {
+        this->ldgXY(kidx);
+        accumulate();  // on the previous k-block
+        this->stsXY();
+        __syncthreads();
+        this->pageWr ^= 1;
+        this->pageRd ^= 1;
+      }
+    }
+
+    accumulate();  // last iteration
+  }
+
+  DI void loopForward() {
+    // reuse X
+    int kidx = P::Kblk;
+    if (kidx < this->k) {
+      this->ldgY(kidx);
+      accumulate();  // on the previous k-block
+      this->stsY(this->sy + this->pageWr * P::SmemPage);
+      __syncthreads();
+      this->pageWr ^= 1;
+      this->pageRd ^= 1;
+      kidx += P::Kblk;
+    }
+
+    for (; kidx < this->k; kidx += P::Kblk) {
       this->ldgXY(kidx);
       accumulate();  // on the previous k-block
       this->stsXY();
@@ -168,7 +215,31 @@ struct PairwiseDistances : public BaseClass {
       this->pageWr ^= 1;
       this->pageRd ^= 1;
     }
-    accumulate();  // last iteration
+  }
+
+  DI void loopReverse() {
+    auto startK = ((this->k / P::Kblk) - 2) * P::Kblk;
+    // reuse X
+    if (startK >= 0) {
+      this->ldgY(startK);
+      accumulate();  // on the previous k-block
+      this->stsY(this->sy + this->pageWr * P::SmemPage);
+      __syncthreads();
+
+      this->pageWr ^= 1;
+      this->pageRd ^= 1;
+      startK -= P::Kblk;
+    }
+
+    for (int kidx = startK; kidx >= 0; kidx -= P::Kblk) {
+      this->ldgXY(kidx);
+      accumulate();  // on the previous k-block
+      this->stsXY();
+      __syncthreads();
+
+      this->pageWr ^= 1;
+      this->pageRd ^= 1;
+    }
   }
 
   DI void accumulate() {

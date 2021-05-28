@@ -218,13 +218,13 @@ struct Contractions_NT {
   int acccolid;
 
   /** base smem pointer for X data storage */
-  DataT* sx;
+  DataT* const sx;
   /** base smem pointer for Y data storage */
-  DataT* sy;
+  DataT* const sy;
   /** index pointing the correct smem page for writing after `ldgXY()` */
-  int pageWr;
+  int8_t pageWr;
   /** index pointing the correct smem page for reading during `ldsXY()` */
-  int pageRd;
+  int8_t pageRd;
 
   /** block of X data loaded from smem after `ldsXY()` */
   DataT regx[P::AccRowsPerTh][P::Veclen];
@@ -333,7 +333,6 @@ struct Contractions_NT {
     ldsY(kidx, sy + pageRd * P::SmemPage);
   }
 
- private:
   DI void ldgX(IdxT kidx) {
     if (isRowMajor) {
       auto numRows = m;
@@ -396,16 +395,16 @@ struct Contractions_NT {
     }
   }
 
-  DI void stsX(DataT* smem) {
-    auto* saddr = smem + srowid * P::SmemStride + scolid;
+  DI void stsX(DataT* const smem) {
+    auto* const saddr = smem + srowid * P::SmemStride + scolid;
 #pragma unroll
     for (int i = 0; i < P::LdgPerThX; ++i) {
       sts(saddr + i * P::LdgRowsX * P::SmemStride, ldgDataX[i]);
     }
   }
 
-  DI void stsY(DataT* smem) {
-    auto* saddr = smem + srowid * P::SmemStride + scolid;
+  DI void stsY(DataT* const smem) {
+    auto* const saddr = smem + srowid * P::SmemStride + scolid;
 #pragma unroll
     for (int i = 0; i < P::LdgPerThY; ++i) {
       sts(saddr + i * P::LdgRowsY * P::SmemStride, ldgDataY[i]);
